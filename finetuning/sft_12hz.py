@@ -123,14 +123,30 @@ def train():
     if args.use_mtp:
         from qwen_tts.core.mtp import MTPConfig, MTPModule
 
+        # Access talker config - may be object or dict depending on how it was loaded
+        talker_cfg = config.talker_config
+        if hasattr(talker_cfg, "hidden_size"):
+            # It's an object with attributes
+            hidden_size = talker_cfg.hidden_size
+            hidden_act = talker_cfg.hidden_act
+            rms_norm_eps = talker_cfg.rms_norm_eps
+            code_pred_cfg = talker_cfg.code_predictor_config
+            vocab_size = code_pred_cfg.vocab_size if hasattr(code_pred_cfg, "vocab_size") else code_pred_cfg["vocab_size"]
+        else:
+            # It's a dict
+            hidden_size = talker_cfg["hidden_size"]
+            hidden_act = talker_cfg["hidden_act"]
+            rms_norm_eps = talker_cfg["rms_norm_eps"]
+            vocab_size = talker_cfg["code_predictor_config"]["vocab_size"]
+
         mtp_config = MTPConfig(
             num_mtp_heads=args.num_mtp_heads,
-            hidden_size=config.talker_config["hidden_size"],
-            trunk_hidden_size=config.talker_config["hidden_size"],
+            hidden_size=hidden_size,
+            trunk_hidden_size=hidden_size,
             num_trunk_layers=2,
-            vocab_size=config.talker_config["code_predictor_config"]["vocab_size"],
-            hidden_act=config.talker_config["hidden_act"],
-            rms_norm_eps=config.talker_config["rms_norm_eps"],
+            vocab_size=vocab_size,
+            hidden_act=hidden_act,
+            rms_norm_eps=rms_norm_eps,
             warmup_steps=args.mtp_warmup_steps,
         )
         mtp_module = MTPModule(mtp_config)
