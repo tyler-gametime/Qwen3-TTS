@@ -400,6 +400,9 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         spk_id=None,
         spk_is_dialect=None,
         codec_language_id=None,
+        use_mtp=False,
+        num_mtp_heads=4,
+        mtp_trunk_layers=2,
         **kwargs,
     ):
         super().__init__(
@@ -449,6 +452,10 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         self.codec_bos_id = codec_bos_id
         self.spk_id = spk_id
         self.spk_is_dialect = spk_is_dialect
+        # MTP (Multi-Token Prediction) configuration
+        self.use_mtp = use_mtp
+        self.num_mtp_heads = num_mtp_heads
+        self.mtp_trunk_layers = mtp_trunk_layers
 
 
 class Qwen3TTSConfig(PretrainedConfig):

@@ -44,6 +44,7 @@ from transformers.utils import can_return_tuple, logging
 from transformers.utils.hub import cached_file
 
 from ...inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from ..mtp import MTPConfig, MTPModule
 from .configuration_qwen3_tts import (Qwen3TTSConfig,
                                       Qwen3TTSSpeakerEncoderConfig,
                                       Qwen3TTSTalkerCodePredictorConfig,
@@ -1583,6 +1584,23 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         )
         self.rope_deltas = None
 
+        # MTP (Multi-Token Prediction) module for parallel codebook prediction
+        self.use_mtp = getattr(config, "use_mtp", False)
+        self.mtp_module = None
+        if self.use_mtp:
+            num_mtp_heads = getattr(config, "num_mtp_heads", 4)
+            mtp_trunk_layers = getattr(config, "mtp_trunk_layers", 2)
+            mtp_config = MTPConfig(
+                num_mtp_heads=num_mtp_heads,
+                hidden_size=config.hidden_size,
+                trunk_hidden_size=config.hidden_size,
+                num_trunk_layers=mtp_trunk_layers,
+                vocab_size=config.code_predictor_config.vocab_size,
+                hidden_act=config.hidden_act,
+                rms_norm_eps=config.rms_norm_eps,
+            )
+            self.mtp_module = MTPModule(mtp_config)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1644,6 +1662,97 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         sub_talker_loss = sub_talker_outputs.loss
         return sub_talker_logits, sub_talker_loss
 
+    def _generate_with_mtp(
+        self,
+        input_ids: torch.Tensor,
+        last_id_hidden: torch.Tensor,
+        past_hidden: torch.Tensor,
+        do_sample: bool = True,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        temperature: Optional[float] = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate codebook tokens using MTP for first N tokens, then AR for the rest.
+
+        This hybrid approach predicts cb1-cbN in parallel using the MTP module,
+        then falls back to sequential AR generation for cbN+1 to cb31.
+
+        Args:
+            input_ids: First codebook token (cb0), shape (batch, 1).
+            last_id_hidden: Embedding of cb0, shape (batch, 1, hidden_size).
+            past_hidden: Hidden state from talker, shape (batch, 1, hidden_size).
+            do_sample: Whether to sample or use argmax.
+            top_p: Nucleus sampling probability.
+            top_k: Top-k filtering value.
+            temperature: Sampling temperature.
+
+        Returns:
+            Tuple of:
+                - codec_ids: All codebook tokens, shape (batch, num_code_groups).
+                - codec_hiddens: Embeddings of all tokens, shape (batch, num_code_groups, hidden_size).
+        """
+        num_mtp_heads = self.mtp_module.config.num_mtp_heads
+        num_ar_tokens = self.config.num_code_groups - 1 - num_mtp_heads
+
+        # Squeeze hidden states for MTP input: (batch, 1, hidden) -> (batch, hidden)
+        talker_hidden = past_hidden.squeeze(1)
+        cb0_embed = last_id_hidden.squeeze(1)
+
+        # Generate first N codebooks in parallel using MTP
+        mtp_tokens = self.mtp_module.generate(
+            talker_hidden=talker_hidden,
+            cb0_embed=cb0_embed,
+            temperature=temperature if temperature is not None else 1.0,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample if do_sample is not None else True,
+        )  # (batch, num_mtp_heads)
+
+        # Collect embeddings for MTP tokens
+        mtp_embeds = []
+        for i in range(num_mtp_heads):
+            # code_predictor embeddings are indexed 0 to 30 for cb1 to cb31
+            embed = self.code_predictor.get_input_embeddings()[i](mtp_tokens[:, i : i + 1])
+            mtp_embeds.append(embed)
+
+        # If there are remaining codebooks to predict with AR
+        if num_ar_tokens > 0:
+            # Build prefix for AR: [past_hidden, cb0_embed, mtp_cb1_embed, ..., mtp_cbN_embed]
+            ar_prefix = torch.cat([past_hidden, last_id_hidden] + mtp_embeds, dim=1)
+
+            # Generate remaining tokens with AR
+            ar_result = self.code_predictor.generate(
+                inputs_embeds=ar_prefix,
+                max_new_tokens=num_ar_tokens,
+                do_sample=do_sample,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                return_dict_in_generate=True,
+            )
+            ar_tokens = ar_result.sequences  # (batch, num_ar_tokens)
+
+            # Collect embeddings for AR tokens
+            ar_embeds = []
+            for i in range(num_ar_tokens):
+                # Index offset: mtp_tokens cover cb1-cbN, AR covers cbN+1 to cb31
+                embed_idx = num_mtp_heads + i
+                embed = self.code_predictor.get_input_embeddings()[embed_idx](ar_tokens[:, i : i + 1])
+                ar_embeds.append(embed)
+
+            # Combine all tokens and embeddings
+            all_pred_tokens = torch.cat([mtp_tokens, ar_tokens], dim=1)
+            all_pred_embeds = mtp_embeds + ar_embeds
+        else:
+            all_pred_tokens = mtp_tokens
+            all_pred_embeds = mtp_embeds
+
+        # Build final outputs
+        codec_ids = torch.cat([input_ids, all_pred_tokens], dim=-1)  # (batch, num_code_groups)
+        codec_hiddens = torch.cat([last_id_hidden] + all_pred_embeds, dim=1)  # (batch, num_code_groups, hidden)
+
+        return codec_ids, codec_hiddens
+
     @can_return_tuple
     def forward(
         self,
@@ -1680,22 +1789,35 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
-            predictor_result = self.code_predictor.generate(
-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
-                do_sample=subtalker_dosample,
-                top_p=subtalker_top_p,
-                top_k=subtalker_top_k,
-                temperature=subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
-            codec_hiddens = torch.cat(
-                [last_id_hidden]
-                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
-                dim=1,
-            )
+
+            # Use MTP for parallel prediction of first N codebooks, then AR for the rest
+            if self.use_mtp and self.mtp_module is not None:
+                codec_ids, codec_hiddens = self._generate_with_mtp(
+                    input_ids=input_ids,
+                    last_id_hidden=last_id_hidden,
+                    past_hidden=past_hidden,
+                    do_sample=subtalker_dosample,
+                    top_p=subtalker_top_p,
+                    top_k=subtalker_top_k,
+                    temperature=subtalker_temperature,
+                )
+            else:
+                # Original AR generation path
+                predictor_result = self.code_predictor.generate(
+                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+                    max_new_tokens=self.config.num_code_groups - 1,
+                    do_sample=subtalker_dosample,
+                    top_p=subtalker_top_p,
+                    top_k=subtalker_top_k,
+                    temperature=subtalker_temperature,
+                    return_dict_in_generate=True,
+                )
+                codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+                codec_hiddens = torch.cat(
+                    [last_id_hidden]
+                    + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                    dim=1,
+                )
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
 
             if generation_step < trailing_text_hidden.shape[1]:
