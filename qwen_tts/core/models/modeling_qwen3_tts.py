@@ -426,9 +426,9 @@ def mel_spectrogram(
         torch.Tensor: Mel spectrogram.
     """
     if torch.min(y) < -1.0:
-        print(f"[WARNING] Min value of input waveform signal is {torch.min(y)}")
+        logger.warning(f"Min value of input waveform signal is {torch.min(y)}")
     if torch.max(y) > 1.0:
-        print(f"[WARNING] Max value of input waveform signal is {torch.max(y)}")
+        logger.warning(f"Max value of input waveform signal is {torch.max(y)}")
 
     device = y.device
 
@@ -1610,11 +1610,23 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         return self.model
     
     def forward_sub_talker_finetune(self, codec_ids, talker_hidden_states):
-        assert len(codec_ids.shape) == 2
-        assert len(talker_hidden_states.shape) == 2
-        assert codec_ids.shape[0] == talker_hidden_states.shape[0]
-        assert talker_hidden_states.shape[1] == self.config.hidden_size
-        assert codec_ids.shape[1] == self.config.num_code_groups
+        if len(codec_ids.shape) != 2:
+            raise ValueError(f"codec_ids must be 2D tensor, got shape {codec_ids.shape}")
+        if len(talker_hidden_states.shape) != 2:
+            raise ValueError(f"talker_hidden_states must be 2D tensor, got shape {talker_hidden_states.shape}")
+        if codec_ids.shape[0] != talker_hidden_states.shape[0]:
+            raise ValueError(
+                f"Batch size mismatch: codec_ids has {codec_ids.shape[0]}, "
+                f"talker_hidden_states has {talker_hidden_states.shape[0]}"
+            )
+        if talker_hidden_states.shape[1] != self.config.hidden_size:
+            raise ValueError(
+                f"talker_hidden_states dim 1 must be {self.config.hidden_size}, got {talker_hidden_states.shape[1]}"
+            )
+        if codec_ids.shape[1] != self.config.num_code_groups:
+            raise ValueError(
+                f"codec_ids dim 1 must be {self.config.num_code_groups}, got {codec_ids.shape[1]}"
+            )
 
         sub_talker_inputs_embeds = [talker_hidden_states.unsqueeze(1)]
 
@@ -1939,7 +1951,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     
     @torch.inference_mode()
     def extract_speaker_embedding(self, audio, sr):
-        assert sr == 24000, "Only support 24kHz audio"
+        if sr != 24000:
+            raise ValueError(f"Only 24kHz audio is supported, got {sr}Hz")
         mels = mel_spectrogram(
             torch.from_numpy(audio).unsqueeze(0), 
             n_fft=1024, 
@@ -1956,7 +1969,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     @torch.inference_mode()
     def generate_speaker_prompt(
         self,
-        voice_clone_prompt: list[dict]
+        voice_clone_prompt: dict
     ):
         voice_clone_spk_embeds = []
         for index in range(len(voice_clone_prompt['ref_spk_embedding'])):
@@ -2061,8 +2074,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
                 if i not in (self.config.talker_config.codec_eos_token_id,)
             ],
-            "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
-            "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
+            "output_hidden_states": kwargs.get("output_hidden_states", True),
+            "return_dict_in_generate": kwargs.get("return_dict_in_generate", True)
         }
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
