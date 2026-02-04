@@ -267,9 +267,20 @@ def train():
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
 
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
+            # Handle both local paths and HuggingFace Hub paths
+            if os.path.isdir(MODEL_PATH):
+                # Local path - copy directly
+                shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+                input_config_file = os.path.join(MODEL_PATH, "config.json")
+            else:
+                # HuggingFace Hub path - download snapshot first
+                from huggingface_hub import snapshot_download
+                local_model_path = snapshot_download(MODEL_PATH)
+                shutil.copytree(local_model_path, output_dir, dirs_exist_ok=True)
+                input_config_file = os.path.join(local_model_path, "config.json")
+
             output_config_file = os.path.join(output_dir, "config.json")
             with open(input_config_file, encoding="utf-8") as f:
                 config_dict = json.load(f)
