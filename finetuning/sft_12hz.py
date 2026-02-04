@@ -99,7 +99,15 @@ def train():
     parser.add_argument("--mtp_loss_weight", type=float, default=0.5, help="Max MTP loss weight after warmup")
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    # Create output directory for logging
+    os.makedirs(args.output_model_path, exist_ok=True)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=4,
+        mixed_precision="bf16",
+        log_with="tensorboard",
+        project_dir=args.output_model_path,
+    )
 
     MODEL_PATH = args.init_model_path
 
